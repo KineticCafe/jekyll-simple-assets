@@ -1,142 +1,138 @@
 # frozen_string_literal: true
 
-require 'css_parser'
-require 'tempfile'
+require "css_parser"
+require "tempfile"
 
 module Jekyll
-module SimpleAssets
+  module SimpleAssets
+    def self.critical_css_source_files
+      @@critical_css_source_files ||= {}
+    end
 
+    def self.make_temp_css_files_for_critical(asset)
+      SimpleAssets.config["critical_css"]["css_files"].each do |path|
+        next unless asset.path == path || asset.path == path.sub(/\.css$/, ".scss")
 
-def self.critical_css_source_files ()
-	@@critical_css_source_files ||= {}
-end
+        f = Tempfile.new(["css-source", ".css"])
+        f.write asset.output
+        f.close
+        File.chmod(0o755, f.path)
 
-def self.make_temp_css_files_for_critical (asset)
-	SimpleAssets::config['critical_css']['css_files'].each do |path|
-		next unless asset.path == path || asset.path == path.sub(/\.css$/, '.scss')
+        Jekyll.logger.debug("SimpleAssets:", "Created new temp file for css: #{asset.path} at: #{f.path}")
 
-		f = Tempfile.new([ 'css-source', '.css' ])
-		f.write asset.output
-		f.close
-		File.chmod(0755, f.path)
+        SimpleAssets.critical_css_source_files[path] = {"file" => f, "page" => asset}
+      end
+    end
 
-		Jekyll.logger.debug("SimpleAssets:", "Created new temp file for css: #{ asset.path } at: #{ f.path }")
+    def self.get_html_input_for_critical(doc, site)
+      return unless doc.respond_to? "[]"
 
-		SimpleAssets::critical_css_source_files[path] = { 'file' => f, 'page' => asset }
-	end
-end
+      SimpleAssets.config["critical_css"]["files"].each do |file|
+        next if file["html"]
 
-def self.get_html_input_for_critical (doc, site)
-	return unless doc.respond_to? '[]'
+        page_path = doc.path.sub("#{site.config["source"]}/", "")
 
-	SimpleAssets::config['critical_css']['files'].each do |file|
-		next if file['html']
+        next unless page_path == file["input_page_path"] || file["layout"] == doc["layout"]
 
-		page_path = doc.path.sub("#{ site.config['source'] }/", '')
+        file["html"] = doc.output
+      end
+    end
 
-		next unless page_path == file['input_page_path'] || file['layout'] == doc['layout']
+    def self.generate_critical_css(site)
+      css_files_str = ""
 
-		file['html'] = doc.output
-	end
-end
+      SimpleAssets.critical_css_source_files.each do |_, f|
+        css_files_str += "--css #{f["file"].path} "
 
-def self.generate_critical_css (site)
-	css_files_str = ''
+        f["css"] = CssParser::Parser.new
+        f["css"].load_string! f["page"].output
+      end
 
-	SimpleAssets::critical_css_source_files.each do |_, f|
-		css_files_str += "--css #{ f['file'].path } "
+      SimpleAssets.config["critical_css"]["files"].each do |file|
+        css_path = File.join(site.config["destination"], file["output_file"])
 
-		f['css'] = CssParser::Parser.new
-		f['css'].load_string! f['page'].output
-	end
+        html = file["html"]
 
-	SimpleAssets::config['critical_css']['files'].each do |file|
-		css_path = File.join(site.config['destination'], file['output_file'])
+        critical_cmd = "npx critical #{css_files_str}"
 
-		html = file['html']
+        Jekyll.logger.debug("SimpleAssets:", "Running command: #{critical_cmd}")
 
-		critical_cmd = "npx critical #{ css_files_str }"
+        Open3.popen3(critical_cmd) do |stdin, stdout, stderr, wait_thr|
+          stdin.write(html)
+          stdin.close
 
-		Jekyll.logger.debug("SimpleAssets:", "Running command: #{ critical_cmd }")
+          if !wait_thr.value.success? || stderr.read != ""
+            Jekyll.logger.error("SimpleAssets:", "Critical (css) error:")
+            stderr.each do |line|
+              Jekyll.logger.error("", line)
+            end
+          elsif stderr.read != ""
+            Jekyll.logger.error("SimpleAssets:", "Critical (css) error:")
+            stderr.each do |line|
+              Jekyll.logger.error("", line)
+            end
+          end
 
-		Open3.popen3(critical_cmd) do |stdin, stdout, stderr, wait_thr|
-			stdin.write(html)
-			stdin.close
+          critical_css_str = stdout.read
 
-			if !wait_thr.value.success? || stderr.read != ''
-				Jekyll.logger.error("SimpleAssets:", 'Critical (css) error:')
-				stderr.each do |line|
-					Jekyll.logger.error("", line)
-				end
-			elsif stderr.read != ''
-				Jekyll.logger.error("SimpleAssets:", 'Critical (css) error:')
-				stderr.each do |line|
-					Jekyll.logger.error("", line)
-				end
-			end
+          asset_path = file["output_file"].sub(/^\//, "")
 
-			critical_css_str = stdout.read
+          base64hash = Digest::MD5.base64digest(critical_css_str)
 
-			asset_path = file['output_file'].sub(/^\//, '')
+          hash = base64hash[0, SimpleAssets.hash_length].gsub(/[+\/]/, "_")
 
-			base64hash = Digest::MD5.base64digest(critical_css_str)
+          SimpleAssets.asset_contenthash_map[asset_path] = hash
 
-			hash = base64hash[0, SimpleAssets::hash_length].gsub(/[+\/]/, '_')
+          IO.write(css_path, critical_css_str)
 
-			SimpleAssets::asset_contenthash_map[asset_path] = hash
+          site.keep_files << asset_path
 
-			IO.write(css_path, critical_css_str)
+          if file["extract"]
+            critical_css = CssParser::Parser.new
 
-			site.keep_files << asset_path
+            critical_css.load_string! critical_css_str
 
-			if file['extract']
-				critical_css = CssParser::Parser.new
+            SimpleAssets.critical_css_source_files.each do |_, f|
+              f["css"].each_rule_set do |source_rule_set, source_media_type|
+                critical_css.each_rule_set do |critical_rule_set, critical_media_type|
+                  if critical_rule_set.selectors.join(",") == source_rule_set.selectors.join(",")
+                    f["css"].remove_rule_set! source_rule_set, source_media_type
+                    f["extract"] = true
 
-				critical_css.load_string! critical_css_str
+                    break
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
 
-				SimpleAssets::critical_css_source_files.each do |_, f|
-					f['css'].each_rule_set do |source_rule_set, source_media_type|
-						critical_css.each_rule_set do |critical_rule_set, critical_media_type|
-							if critical_rule_set.selectors.join(',') == source_rule_set.selectors.join(',')
-								f['css'].remove_rule_set! source_rule_set, source_media_type
-								f['extract'] = true
+      SimpleAssets.critical_css_source_files.each do |_, f|
+        leftover_css = f["css"].to_s if f["extract"]
 
-								break
-							end
-						end
-					end
-				end
-			end
-		end
-	end
+        # css_parser leaves blank keyframes so fix them
+        keyframes = f["page"].output.scan(/@keyframes\s+(?:.*?)\s*{(?:\s*\S*?\s*{.*?}\s*)+}/m)
+        keyframes.each { |keyframe| leftover_css += keyframe }
 
-	SimpleAssets::critical_css_source_files.each do |_, f|
-		leftover_css = f['css'].to_s if f['extract']
+        f["page"].output
+      end
+    end
 
-		# css_parser leaves blank keyframes so fix them
-		keyframes = f['page'].output.scan(/@keyframes\s+(?:.*?)\s*{(?:\s*\S*?\s*{.*?}\s*)+}/m)
-		keyframes.each { |keyframe| leftover_css += keyframe }
+    def self.resolve_critical_css_content_hashes(site)
+      SimpleAssets.critical_css_source_files.each do |_, source_file|
+        page = source_file["page"]
+        page_path = page.path.sub("#{site.config["source"]}/", "")
 
-		f['page'].output
-	end
-end
+        SimpleAssets.config["critical_css"]["files"].each do |file|
+          css_path = File.join(site.config["destination"], file["output_file"])
+          content = IO.read(css_path)
 
-def self.resolve_critical_css_content_hashes (site)
-	SimpleAssets::critical_css_source_files.each do |_, source_file|
-		page = source_file['page']
-		page_path = page.path.sub("#{ site.config['source'] }/", '')
+          critical = SimpleAssets.replace_placeholders_for_path(page_path, content)
 
-		SimpleAssets::config['critical_css']['files'].each do |file|
-			css_path  = File.join(site.config['destination'], file['output_file'])
-			content = IO.read(css_path)
-
-			critical = SimpleAssets::replace_placeholders_for_path(page_path, content)
-
-			IO.write(css_path, critical)
-		end
-	end
-end
-
-
-end
+          IO.write(css_path, critical)
+        end
+      end
+    end
+  end
 end
