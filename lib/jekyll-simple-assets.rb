@@ -91,9 +91,11 @@ Liquid::Template.register_tag("bundle_raw", Jekyll::SimpleAssets::BundleRawTag)
 
 Liquid::Template.register_filter(Jekyll::SimpleAssets::SimpleAssetsFilters)
 
-Jekyll::Hooks.register :site, :post_render, priority: :low do |site, payload|
+Jekyll::Hooks.register :site, :after_init do |site, _payload|
   Jekyll::SimpleAssets.site(site)
+end
 
+Jekyll::Hooks.register :site, :post_render, priority: :low do |site, payload|
   potential_assets = []
 
   potential_assets += site.pages
